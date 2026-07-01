@@ -29,9 +29,13 @@ SEVERE_CODES = {
 
 def geocode(location: str) -> tuple:
     """Convert a location string to (lat, lon)."""
-    resp = requests.get(GEOCODING_URL, params={"name": location, "count": 1}, timeout=10)
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
+    # Try full location first, then fall back to first word (city name only)
+    for search_term in [location, location.split(",")[0].strip()]:
+        resp = requests.get(GEOCODING_URL, params={"name": search_term, "count": 1}, timeout=10)
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if results:
+            break
     if not results:
         raise ValueError(f"Could not geocode location: {location}")
     r = results[0]
