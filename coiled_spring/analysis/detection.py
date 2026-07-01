@@ -1,302 +1,271 @@
-"""Coiled Spring detection engine — the core analytical logic."""
-
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from datetime import date, timedelta
-from typing import Optional
+"""
+detection.py — Coiled Spring Opportunity Detection
+Identifies clients where high search intent + temporary conversion dip
+coincide with an external shock (weather, political, economic, news).
+"""
 
 import numpy as np
-import pandas as pd
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
 
-from config import (
-    CVR_DROP_THRESHOLD_SD, IMPRESSION_FLOOR_PCT, MIN_SIGNALS_FOR_FLAG,
-    SPRING_MIN_DURATION_DAYS, BASELINE_PERIOD_DAYS, DETECTION_WINDOW_DAYS,
-    SIGNAL_ANOMALY_SD, NEWS_SCORE_THRESHOLD, SEASONAL_DEVIATION_PCT,
-    ECONOMIC_DEVIATION_PCT, CONFIDENCE_THRESHOLDS, RECOVERY_WINDOWS,
-)
-
+# ── Data Structures ───────────────────────────────────────────────────────────
 
 @dataclass
-class CoiledSpring:
-    campaign_id:    str
-    campaign_name:  str
-    start_date:     date
-    end_date:       date
-    duration_days:  int
-    confidence:     str   # "low" | "medium" | "high"
-    confidence_score: int
-    cvr_baseline:   float
-    cvr_current:    float
-    cvr_z_score:    float
-    impression_trend: str  # "rising" | "stable" | "slight_decline"
-    active_signals: list[str]
-    signal_details: dict
-    rebound_min_days: int
-    rebound_max_days: int
-    estimated_spend_at_risk: float
-    projected_recovery_uplift: float
-    recommendation: str
-    campaign_df:    pd.DataFrame = field(repr=False)
-    signals_df:     pd.DataFrame = field(repr=False)
+class ExternalShock:
+    shock_type: str           # 'weather', 'political', 'economic', 'news_event'
+    description: str          # Human-readable description
+    severity: float           # 0.0 - 1.0
+    start_date: str
+    location: str
+    source: str               # Which API detected it
+
+@dataclass
+class CoiledSpringOpportunity:
+    client_id: str
+    client_name: str
+    score: float              # 0-100 composite Coiled Spring score
+    intent_score: float       # Search intent strength (0-100)
+    conversion_dip_pct: float # % drop in conversion rate (negative = dip)
+    shocks: list              # List of ExternalShock objects
+    baseline_cvr: float       # Normal conversion rate
+    current_cvr: float        # Current (depressed) conversion rate
+    estimated_rebound_days: int
+    recommendation: str       # Plain-English action for account manager
+    detected_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
 
-class CoiledSpringDetector:
+# ── Thresholds ────────────────────────────────────────────────────────────────
 
-    def detect(
-        self,
-        campaign_id: str,
-        campaign_name: str,
-        campaign_df: pd.DataFrame,
-        signals_df: pd.DataFrame,
-    ) -> Optional[CoiledSpring]:
-        """
-        Returns the most severe active CoiledSpring for this campaign, or None.
-        Examines the most recent DETECTION_WINDOW_DAYS of data against a
-        BASELINE_PERIOD_DAYS baseline.
-        """
-        if len(campaign_df) < BASELINE_PERIOD_DAYS + SPRING_MIN_DURATION_DAYS:
-            return None
+INTENT_THRESHOLD       = 60.0   # Minimum intent score to qualify
+CONVERSION_DIP_MIN     = -0.10  # At least 10% drop in CVR
+SHOCK_SEVERITY_MIN     = 0.3    # Minimum shock severity to count
+COILED_SPRING_MIN      = 55.0   # Minimum composite score to surface opportunity
 
-        # Align signals to campaign dates
-        signals_df = signals_df.reindex(campaign_df.index).ffill().bfill()
 
-        baseline = campaign_df.iloc[:BASELINE_PERIOD_DAYS]
-        recent   = campaign_df.iloc[BASELINE_PERIOD_DAYS:]
+# ── Core Detection Logic ──────────────────────────────────────────────────────
 
-        cvr_mean = baseline["cvr"].mean()
-        cvr_std  = baseline["cvr"].std()
-        if cvr_std == 0:
-            return None
+def compute_intent_score(impressions_recent: float, impressions_baseline: float) -> float:
+    """
+    Score search intent 0-100 based on impression volume vs. baseline.
+    High impressions = people are still searching = high intent.
+    """
+    if impressions_baseline <= 0:
+        return 0.0
+    ratio = impressions_recent / impressions_baseline
+    # Scale: 1.0x baseline = 50, 1.5x = 75, 2x = 100, 0.5x = 25
+    score = min(100.0, max(0.0, ratio * 50.0))
+    return round(score, 1)
 
-        imp_baseline = baseline["impression_share"].mean()
 
-        # Scan the recent window for consecutive flagged days
-        flags = self._flag_days(
-            recent, signals_df.iloc[BASELINE_PERIOD_DAYS:],
-            cvr_mean, cvr_std, imp_baseline,
+def compute_conversion_dip(current_cvr: float, baseline_cvr: float) -> float:
+    """
+    Returns % change in conversion rate. Negative = dip.
+    e.g., -0.20 means 20% below baseline.
+    """
+    if baseline_cvr <= 0:
+        return 0.0
+    return round((current_cvr - baseline_cvr) / baseline_cvr, 4)
+
+
+def compute_shock_score(shocks: list) -> float:
+    """
+    Combine multiple external shocks into a single severity score (0-1).
+    Uses weighted average, capped at 1.0.
+    """
+    if not shocks:
+        return 0.0
+    total = sum(s.severity for s in shocks)
+    return round(min(1.0, total / len(shocks) + (0.1 * (len(shocks) - 1))), 3)
+
+
+def compute_coiled_spring_score(
+    intent_score: float,
+    conversion_dip_pct: float,
+    shock_score: float
+) -> float:
+    """
+    Composite Coiled Spring score (0-100).
+
+    Formula:
+    - Intent (40%): High intent = spring is loaded
+    - Dip severity (35%): Bigger dip = bigger rebound opportunity
+    - Shock score (25%): Confirmed external cause = confidence multiplier
+    """
+    dip_score = min(100.0, abs(conversion_dip_pct) * 400)  # 25% dip = 100
+    shock_component = shock_score * 100
+
+    score = (
+        0.40 * intent_score +
+        0.35 * dip_score +
+        0.25 * shock_component
+    )
+    return round(min(100.0, score), 1)
+
+
+def estimate_rebound_days(shocks: list, conversion_dip_pct: float) -> int:
+    """
+    Estimate how many days until conversion rates rebound.
+    Based on shock type and dip severity.
+    """
+    base_days = {
+        "weather": 5,
+        "news_event": 7,
+        "political": 14,
+        "economic": 21,
+    }
+    if not shocks:
+        return 10
+
+    primary_shock = max(shocks, key=lambda s: s.severity)
+    base = base_days.get(primary_shock.shock_type, 10)
+
+    # Deeper dips take longer to recover
+    dip_factor = 1 + abs(conversion_dip_pct)
+    return round(base * dip_factor)
+
+
+def generate_recommendation(opportunity: "CoiledSpringOpportunity") -> str:
+    """
+    Generate a plain-English recommendation for the account manager.
+    """
+    shock_labels = ", ".join(set(s.shock_type for s in opportunity.shocks))
+    dip_pct = abs(round(opportunity.conversion_dip_pct * 100, 1))
+    rebound = opportunity.estimated_rebound_days
+
+    if opportunity.score >= 80:
+        urgency = "STRONG BUY"
+    elif opportunity.score >= 65:
+        urgency = "RECOMMENDED"
+    else:
+        urgency = "MONITOR"
+
+    return (
+        f"[{urgency}] {opportunity.client_name} shows a {dip_pct}% conversion dip "
+        f"driven by {shock_labels} — but search intent remains high. "
+        f"Recommend maintaining or increasing spend now to capture market share. "
+        f"Estimated rebound window: {rebound} days. "
+        f"Competitors who cut spend will lose ground during recovery."
+    )
+
+
+# ── Main Detection Function ───────────────────────────────────────────────────
+
+def detect_opportunities(clients_data: list, shocks_by_location: dict) -> list:
+    """
+    Main entry point. Takes client performance data and detected external shocks,
+    returns a ranked list of CoiledSpring opportunities.
+
+    Args:
+        clients_data: List of dicts with keys:
+            client_id, client_name, location,
+            current_cvr, baseline_cvr,
+            impressions_recent, impressions_baseline
+
+        shocks_by_location: Dict of location -> list of ExternalShock objects
+
+    Returns:
+        List of CoiledSpringOpportunity, sorted by score descending
+    """
+    opportunities = []
+
+    for client in clients_data:
+        client_id       = client["client_id"]
+        client_name     = client["client_name"]
+        location        = client.get("location", "US")
+        current_cvr     = client.get("current_cvr", 0)
+        baseline_cvr    = client.get("baseline_cvr", 0)
+        imp_recent      = client.get("impressions_recent", 0)
+        imp_baseline    = client.get("impressions_baseline", 1)
+
+        # Step 1: Calculate intent score
+        intent_score = compute_intent_score(imp_recent, imp_baseline)
+
+        # Step 2: Calculate conversion dip
+        dip_pct = compute_conversion_dip(current_cvr, baseline_cvr)
+
+        # Step 3: Get relevant external shocks for this client's location
+        shocks = shocks_by_location.get(location, [])
+        active_shocks = [s for s in shocks if s.severity >= SHOCK_SEVERITY_MIN]
+
+        # Step 4: Filter — must meet all minimum thresholds
+        if intent_score < INTENT_THRESHOLD:
+            continue
+        if dip_pct > CONVERSION_DIP_MIN:  # dip_pct is negative, so this filters small dips
+            continue
+
+        # Step 5: Compute composite score
+        shock_score = compute_shock_score(active_shocks)
+        cs_score = compute_coiled_spring_score(intent_score, dip_pct, shock_score)
+
+        if cs_score < COILED_SPRING_MIN:
+            continue
+
+        # Step 6: Build opportunity object
+        rebound_days = estimate_rebound_days(active_shocks, dip_pct)
+
+        opp = CoiledSpringOpportunity(
+            client_id=client_id,
+            client_name=client_name,
+            score=cs_score,
+            intent_score=intent_score,
+            conversion_dip_pct=dip_pct,
+            shocks=active_shocks,
+            baseline_cvr=baseline_cvr,
+            current_cvr=current_cvr,
+            estimated_rebound_days=rebound_days,
+            recommendation=""
         )
+        opp.recommendation = generate_recommendation(opp)
+        opportunities.append(opp)
 
-        windows = self._find_consecutive_windows(flags, SPRING_MIN_DURATION_DAYS)
-        if not windows:
-            return None
+    # Sort by score descending
+    return sorted(opportunities, key=lambda x: x.score, reverse=True)
 
-        # Pick the most recent window (most actionable)
-        win_start_idx, win_end_idx = windows[-1]
-        window_df  = recent.iloc[win_start_idx: win_end_idx + 1]
-        window_sig = signals_df.iloc[BASELINE_PERIOD_DAYS + win_start_idx:
-                                      BASELINE_PERIOD_DAYS + win_end_idx + 1]
 
-        cvr_current = window_df["cvr"].mean()
-        cvr_z       = (cvr_current - cvr_mean) / cvr_std
-        imp_current = window_df["impression_share"].mean()
-        imp_change  = (imp_current - imp_baseline) / imp_baseline
+# ── Quick Test ────────────────────────────────────────────────────────────────
 
-        if imp_change > 0.05:
-            imp_trend = "rising"
-        elif imp_change > IMPRESSION_FLOOR_PCT:
-            imp_trend = "stable"
-        else:
-            imp_trend = "slight_decline"
+if __name__ == "__main__":
+    # Sample data to verify logic works
+    sample_clients = [
+        {
+            "client_id": "client_001",
+            "client_name": "Acme Roofing",
+            "location": "Houston, TX",
+            "current_cvr": 0.018,
+            "baseline_cvr": 0.031,
+            "impressions_recent": 45000,
+            "impressions_baseline": 38000,
+        },
+        {
+            "client_id": "client_002",
+            "client_name": "Gulf Coast HVAC",
+            "location": "Houston, TX",
+            "current_cvr": 0.029,
+            "baseline_cvr": 0.030,
+            "impressions_recent": 12000,
+            "impressions_baseline": 13000,
+        },
+    ]
 
-        active_signals, signal_details = self._score_signals(window_sig, signals_df)
+    sample_shocks = {
+        "Houston, TX": [
+            ExternalShock(
+                shock_type="weather",
+                description="Hurricane Beryl aftermath — heavy flooding",
+                severity=0.85,
+                start_date="2024-07-08",
+                location="Houston, TX",
+                source="open_meteo"
+            )
+        ]
+    }
 
-        if len(active_signals) < MIN_SIGNALS_FOR_FLAG:
-            return None
+    results = detect_opportunities(sample_clients, sample_shocks)
 
-        confidence_score = len(active_signals)
-        if confidence_score >= CONFIDENCE_THRESHOLDS["high"]:
-            confidence = "high"
-        elif confidence_score >= CONFIDENCE_THRESHOLDS["medium"]:
-            confidence = "medium"
-        else:
-            confidence = "low"
-
-        rebound_min, rebound_max = self._rebound_window(active_signals)
-        rebound_midpoint = (rebound_min + rebound_max) / 2
-
-        daily_spend = window_df["cost"].mean()
-        spend_at_risk = daily_spend * rebound_midpoint
-
-        # Uplift = estimated additional conversions at baseline CVR vs current CVR
-        avg_impressions = window_df["impressions"].mean()
-        avg_imp_share   = window_df["impression_share"].mean() / 100
-        avg_ctr         = (window_df["clicks"] / window_df["impressions"].replace(0, 1)).mean()
-        future_clicks   = avg_impressions * avg_imp_share * avg_ctr * rebound_midpoint
-        uplift = future_clicks * (cvr_mean - cvr_current)
-        uplift = max(uplift, 0)
-
-        recommendation = self._build_recommendation(
-            confidence, active_signals, cvr_z, rebound_min, rebound_max, imp_trend
-        )
-
-        return CoiledSpring(
-            campaign_id=campaign_id,
-            campaign_name=campaign_name,
-            start_date=window_df.index[0].date(),
-            end_date=window_df.index[-1].date(),
-            duration_days=len(window_df),
-            confidence=confidence,
-            confidence_score=confidence_score,
-            cvr_baseline=round(cvr_mean, 4),
-            cvr_current=round(cvr_current, 4),
-            cvr_z_score=round(cvr_z, 2),
-            impression_trend=imp_trend,
-            active_signals=active_signals,
-            signal_details=signal_details,
-            rebound_min_days=rebound_min,
-            rebound_max_days=rebound_max,
-            estimated_spend_at_risk=round(spend_at_risk, 2),
-            projected_recovery_uplift=round(uplift, 1),
-            recommendation=recommendation,
-            campaign_df=campaign_df,
-            signals_df=signals_df,
-        )
-
-    # ── Internal helpers ─────────────────────────────────────────────────────
-
-    def _flag_days(
-        self,
-        recent_df: pd.DataFrame,
-        recent_sig: pd.DataFrame,
-        cvr_mean: float,
-        cvr_std: float,
-        imp_baseline: float,
-    ) -> pd.Series:
-        """Returns a boolean Series marking days that meet spring pre-conditions."""
-        cvr_z = (recent_df["cvr"] - cvr_mean) / cvr_std
-        cvr_flag = cvr_z < -CVR_DROP_THRESHOLD_SD
-
-        imp_change = (recent_df["impression_share"] - imp_baseline) / imp_baseline
-        imp_flag = imp_change > IMPRESSION_FLOOR_PCT
-
-        signal_flag = self._any_signal_anomalous(recent_sig)
-
-        return cvr_flag & imp_flag & signal_flag
-
-    def _any_signal_anomalous(self, sig: pd.DataFrame) -> pd.Series:
-        flags = pd.Series(False, index=sig.index)
-
-        if "weather_composite" in sig.columns:
-            weather_mean = sig["weather_composite"].mean()
-            weather_std  = sig["weather_composite"].std() or 1
-            flags |= ((sig["weather_composite"] - weather_mean) / weather_std) > SIGNAL_ANOMALY_SD
-
-        if "news_score" in sig.columns:
-            flags |= sig["news_score"] > NEWS_SCORE_THRESHOLD
-
-        if "seasonal_index" in sig.columns:
-            s_mean = sig["seasonal_index"].mean()
-            flags |= (sig["seasonal_index"] - s_mean).abs() / s_mean > SEASONAL_DEVIATION_PCT
-
-        if "economic_pressure" in sig.columns:
-            ep_mean = sig["economic_pressure"].mean()
-            flags |= (sig["economic_pressure"] - ep_mean).abs() / (ep_mean or 1) > ECONOMIC_DEVIATION_PCT
-
-        return flags
-
-    def _find_consecutive_windows(
-        self, flags: pd.Series, min_days: int
-    ) -> list[tuple[int, int]]:
-        windows: list[tuple[int, int]] = []
-        start = None
-        for i, val in enumerate(flags):
-            if val and start is None:
-                start = i
-            elif not val and start is not None:
-                if (i - start) >= min_days:
-                    windows.append((start, i - 1))
-                start = None
-        if start is not None and (len(flags) - start) >= min_days:
-            windows.append((start, len(flags) - 1))
-        return windows
-
-    def _score_signals(
-        self,
-        window_sig: pd.DataFrame,
-        full_sig: pd.DataFrame,
-    ) -> tuple[list[str], dict]:
-        active = []
-        details: dict = {}
-
-        # Weather
-        if "weather_composite" in window_sig.columns:
-            full_mean = full_sig["weather_composite"].mean()
-            full_std  = full_sig["weather_composite"].std() or 1
-            w_z = (window_sig["weather_composite"].mean() - full_mean) / full_std
-            if w_z > SIGNAL_ANOMALY_SD:
-                active.append("weather")
-                temp_dir = "colder" if window_sig["weather_temp_anomaly"].mean() < 0 else "warmer"
-                details["weather"] = (
-                    f"Significant weather anomaly detected — temperatures running "
-                    f"{abs(window_sig['weather_temp_anomaly'].mean()):.1f}°C {temp_dir} than normal "
-                    f"with elevated precipitation."
-                )
-
-        # News
-        if "news_score" in window_sig.columns:
-            avg_score = window_sig["news_score"].mean()
-            if avg_score > NEWS_SCORE_THRESHOLD:
-                active.append("news")
-                details["news"] = (
-                    f"Elevated news/political activity (intensity: {avg_score:.2f}) "
-                    f"coinciding with the conversion rate drop."
-                )
-
-        # Seasonal
-        if "seasonal_index" in window_sig.columns:
-            s_mean = full_sig["seasonal_index"].mean()
-            s_current = window_sig["seasonal_index"].mean()
-            deviation = (s_current - s_mean) / s_mean
-            if abs(deviation) > SEASONAL_DEVIATION_PCT:
-                active.append("seasonal")
-                direction = "below" if deviation < 0 else "above"
-                details["seasonal"] = (
-                    f"Seasonal index is {abs(deviation)*100:.0f}% {direction} the annual average "
-                    f"for this campaign type — a predictable cyclical trough."
-                )
-
-        # Economic
-        if "economic_pressure" in window_sig.columns:
-            ep_mean = full_sig["economic_pressure"].mean()
-            ep_now  = window_sig["economic_pressure"].mean()
-            if ep_mean > 0 and abs(ep_now - ep_mean) / ep_mean > ECONOMIC_DEVIATION_PCT:
-                active.append("economic")
-                pressure_dir = "increased" if ep_now > ep_mean else "decreased"
-                details["economic"] = (
-                    f"Economic pressure index has {pressure_dir} by "
-                    f"{abs(ep_now - ep_mean)/ep_mean*100:.0f}% — likely reflecting consumer "
-                    f"hesitation, not a loss of demand."
-                )
-
-        return active, details
-
-    def _rebound_window(self, signals: list[str]) -> tuple[int, int]:
-        if not signals:
-            return (7, 30)
-        mins = [RECOVERY_WINDOWS.get(s, (7, 30))[0] for s in signals]
-        maxs = [RECOVERY_WINDOWS.get(s, (7, 30))[1] for s in signals]
-        return (min(mins), max(maxs))
-
-    def _build_recommendation(
-        self,
-        confidence: str,
-        signals: list[str],
-        cvr_z: float,
-        rebound_min: int,
-        rebound_max: int,
-        imp_trend: str,
-    ) -> str:
-        action = "maintain" if confidence == "low" else "increase"
-        signal_str = " and ".join(signals) if signals else "external factors"
-        intent_str = (
-            "rising intent signals suggest demand is building"
-            if imp_trend == "rising"
-            else "steady impression volume confirms ongoing search demand"
-        )
-        return (
-            f"Recommend {action} budget spend. The CVR dip ({cvr_z:.1f} SD below baseline) "
-            f"appears driven by {signal_str} — not declining demand. {intent_str.capitalize()}. "
-            f"Historical patterns for this signal type show recovery within "
-            f"{rebound_min}–{rebound_max} days."
-        )
+    print(f"\nFound {len(results)} Coiled Spring opportunities:\n")
+    for opp in results:
+        print(f"Client: {opp.client_name}")
+        print(f"Score:  {opp.score}/100")
+        print(f"Dip:    {round(opp.conversion_dip_pct * 100, 1)}%")
+        print(f"Recommendation: {opp.recommendation}")
+        print("-" * 60)
